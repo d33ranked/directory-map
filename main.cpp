@@ -10,26 +10,52 @@
 #include <unordered_map>
 #include <memory>
 #include <algorithm>
+#include <cstdio>
 
 namespace fs = std::filesystem;
 
 // ==========================================
-// 1. DATA MODELS
+// 1. DATA MODELS & HELPERS
 // ==========================================
+
+// Helper function to format sizes (B, KB, MB, GB, TB)
+std::string formatSize(uintmax_t bytes) {
+    const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
+    int unitIndex = 0;
+    double size = static_cast<double>(bytes);
+    
+    while (size >= 1024 && unitIndex < 5) {
+        size /= 1024;
+        unitIndex++;
+    }
+    
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%.2f %s", size, units[unitIndex]);
+    return std::string(buf);
+}
+
+// Helper to truncate long strings for the table view
+std::string truncateString(const std::string& str, size_t maxChars) {
+    if (str.length() > maxChars) {
+        return str.substr(0, maxChars - 3) + "...";
+    }
+    return str;
+}
 
 struct File {
     std::string name;
     std::string extension;
-    uintmax_t size;
+    uintmax_t size; // Kept as raw bytes internally
 };
 
 struct Directory {
     std::string name;
     std::string path;
     uintmax_t size = 0; 
-    // Using shared_ptr to prevent massive memory reallocations and OOM crashes
+    
     std::vector<std::shared_ptr<Directory>> directories; 
     std::vector<File> files;
+    std::weak_ptr<Directory> parent; // Required to navigate "up" instantly
 };
 
 // ==========================================
@@ -53,7 +79,7 @@ public:
             std::error_code ec;
             f.size = entry.is_regular_file(ec) ? entry.file_size(ec) : 0;
         } catch (...) {
-            f.size = 0; // Failsafe for unreadable files
+            f.size = 0; 
         }
         return f;
     }
@@ -67,11 +93,6 @@ public:
     ScannerManager() {
         defaultScanner = std::make_shared<DefaultFileScanner>();
     }
-
-    void registerScanner(const std::string& extension, std::shared_ptr<IFileScanner> scanner) {
-        specializedScanners[extension] = scanner;
-    }
-
     File scanFile(const fs::directory_entry& entry) {
         std::string ext = entry.path().extension().string();
         if (specializedScanners.find(ext) != specializedScanners.end()) {
@@ -87,7 +108,8 @@ public:
 
 class DirectoryTracker {
     std::mutex dataMutex;
-    std::shared_ptr<Directory> currentTree;
+    std::shared_ptr<Directory> masterTree;  // The root of the entire scan
+    std::shared_ptr<Directory> currentView; // The directory currently being visualized (Memoized)
     
     std::mutex progressMutex;
     std::string currentScanPath;
@@ -95,21 +117,16 @@ class DirectoryTracker {
     std::atomic<bool> isScanning{false};
     std::thread workerThread;
     ScannerManager scannerManager;
-    std::string currentRootPath;
 
-    // Calculates sizes and sorts directories after flat mapping is complete
     void computeSizesAndSort(std::shared_ptr<Directory> dir) {
         uintmax_t totalSize = 0;
-        for (const auto& f : dir->files) {
-            totalSize += f.size;
-        }
+        for (const auto& f : dir->files) totalSize += f.size;
         for (auto& subDir : dir->directories) {
             computeSizesAndSort(subDir);
             totalSize += subDir->size;
         }
         dir->size = totalSize;
 
-        // Sort descending by size
         std::sort(dir->directories.begin(), dir->directories.end(), 
             [](const std::shared_ptr<Directory>& a, const std::shared_ptr<Directory>& b) { 
                 return a->size > b->size; 
@@ -124,7 +141,6 @@ public:
 
     void startScan(const std::string& path) {
         if (isScanning) return;
-        currentRootPath = path;
         isScanning = true;
         setCurrentScanPath("Initializing...");
 
@@ -137,7 +153,6 @@ public:
             if (rootDir->name.empty()) rootDir->name = rootPath.string();
             rootDir->path = rootPath.string();
 
-            // Hash map to quickly find parent nodes without recursive searching
             std::unordered_map<std::string, std::shared_ptr<Directory>> pathMap;
             pathMap[rootDir->path] = rootDir;
 
@@ -148,17 +163,13 @@ public:
 
             int updateCounter = 0;
 
-            // Flat iteration logic avoiding stack overflow
             while (it != end && isScanning) {
                 try {
                     const fs::directory_entry& entry = *it;
                     std::string currentStr = entry.path().string();
                     std::string parentStr = entry.path().parent_path().string();
 
-                    // Update frontend every 50 iterations to avoid mutex lock throttling
-                    if (++updateCounter % 50 == 0) {
-                        setCurrentScanPath(currentStr);
-                    }
+                    if (++updateCounter % 100 == 0) setCurrentScanPath(currentStr);
 
                     if (entry.is_directory(ec)) {
                         auto newDir = std::make_shared<Directory>();
@@ -167,9 +178,11 @@ public:
                         
                         auto pIt = pathMap.find(parentStr);
                         if (pIt != pathMap.end()) {
+                            newDir->parent = pIt->second; // Link back for memoized UP navigation
                             pIt->second->directories.push_back(newDir);
                         } else {
-                            rootDir->directories.push_back(newDir); // Fallback
+                            newDir->parent = rootDir;
+                            rootDir->directories.push_back(newDir); 
                         }
                         pathMap[currentStr] = newDir;
                     } 
@@ -179,40 +192,48 @@ public:
                             pIt->second->files.push_back(scannerManager.scanFile(entry));
                         }
                     }
-                } catch (...) {
-                    // Suppress aborts on unreadable/corrupted files
-                }
+                } catch (...) {}
 
                 it.increment(ec);
-                if (ec) {
-                    ec.clear(); // Continue even if we hit a restricted directory folder
-                }
+                if (ec) ec.clear(); 
             }
 
             setCurrentScanPath("Calculating sizes...");
             computeSizesAndSort(rootDir);
             
             std::lock_guard<std::mutex> lock(dataMutex);
-            currentTree = rootDir;
+            masterTree = rootDir;
+            currentView = rootDir;
             isScanning = false;
         });
+    }
+
+    // Instantly switch view to a pre-scanned child directory
+    void navigateTo(std::shared_ptr<Directory> target) {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        if (target) currentView = target;
+    }
+
+    // Instantly switch view to the parent directory
+    void navigateUp() {
+        std::lock_guard<std::mutex> lock(dataMutex);
+        if (currentView && !currentView->parent.expired()) {
+            currentView = currentView->parent.lock();
+        }
     }
 
     void setCurrentScanPath(const std::string& path) {
         std::lock_guard<std::mutex> lock(progressMutex);
         currentScanPath = path;
     }
-
     std::string getCurrentScanPath() {
         std::lock_guard<std::mutex> lock(progressMutex);
         return currentScanPath;
     }
-
     bool getIsScanning() const { return isScanning; }
-    
-    std::shared_ptr<Directory> getTree() {
+    std::shared_ptr<Directory> getCurrentView() {
         std::lock_guard<std::mutex> lock(dataMutex);
-        return currentTree;
+        return currentView;
     }
 };
 
@@ -221,75 +242,142 @@ public:
 // ==========================================
 
 struct DrawnSector {
-    std::string path;
+    std::shared_ptr<Directory> dir;
     float startAngle;
     float endAngle;
     int layer;
 };
 
 class Visualizer {
-    int maxLayers = 4; // unsigned int from 3 to 8
+    int maxLayers = 4;
     float ringWidth = 80.0f;
-    Vector2 center;
+    Vector2 sunburstCenter;
     std::vector<DrawnSector> sectors;
+    
+    int listScrollOffset = 0;
 
-    void drawTree(const Directory& dir, int currentLayer, float startAngle, float endAngle) {
-        if (currentLayer >= maxLayers || dir.size == 0) return;
+    void drawTree(const std::shared_ptr<Directory>& dir, int currentLayer, float startAngle, float endAngle) {
+        if (currentLayer >= maxLayers || dir->size == 0) return;
 
         float innerRadius = currentLayer * ringWidth;
         float outerRadius = (currentLayer + 1) * ringWidth;
-
         Color color = ColorFromHSV(startAngle, 0.6f + (currentLayer * 0.1f), 0.8f);
         
-        DrawRing(center, innerRadius, outerRadius, startAngle, endAngle, 36, color);
-        DrawRingLines(center, innerRadius, outerRadius, startAngle, endAngle, 36, BLACK);
+        DrawRing(sunburstCenter, innerRadius, outerRadius, startAngle, endAngle, 36, color);
+        DrawRingLines(sunburstCenter, innerRadius, outerRadius, startAngle, endAngle, 36, BLACK);
 
-        sectors.push_back({dir.path, startAngle, endAngle, currentLayer});
+        sectors.push_back({dir, startAngle, endAngle, currentLayer});
 
         if (currentLayer + 1 < maxLayers) {
             float currentStart = startAngle;
-            for (const auto& subDir : dir.directories) {
-                float angleSpan = (static_cast<float>(subDir->size) / dir.size) * (endAngle - startAngle);
-                if (angleSpan > 0.5f) { // Only draw if visually meaningful
-                    drawTree(*subDir, currentLayer + 1, currentStart, currentStart + angleSpan);
+            for (const auto& subDir : dir->directories) {
+                float angleSpan = (static_cast<float>(subDir->size) / dir->size) * (endAngle - startAngle);
+                if (angleSpan > 0.5f) { 
+                    drawTree(subDir, currentLayer + 1, currentStart, currentStart + angleSpan);
                     currentStart += angleSpan;
                 }
             }
         }
     }
 
-public:
-    void render(std::shared_ptr<Directory> tree, DirectoryTracker& tracker, int screenWidth, int screenHeight) {
-        center = { screenWidth / 2.0f, screenHeight / 2.0f - 40.0f };
-        sectors.clear();
-
-        if (tree) {
-            // 4.1 Draw Sunburst
-            drawTree(*tree, 0, 0.0f, 360.0f);
+    void drawListView(std::shared_ptr<Directory> dir, int screenWidth, int screenHeight) {
+        int startX = 750;
+        int listWidth = screenWidth - startX - 20;
+        
+        // Draw Header
+        DrawRectangle(startX, 60, listWidth, 30, DARKGRAY);
+        DrawText("Name", startX + 10, 65, 20, RAYWHITE);
+        DrawText("Ext", startX + 350, 65, 20, RAYWHITE);
+        DrawText("Size", startX + 450, 65, 20, RAYWHITE);
+        
+        int yOffset = 100;
+        int rowHeight = 25;
+        
+        // Handle Scrolling
+        int totalItems = dir->directories.size() + dir->files.size();
+        int maxVisible = (screenHeight - 160) / rowHeight;
+        
+        if (GetMouseX() > startX) {
+            listScrollOffset -= static_cast<int>(GetMouseWheelMove() * 3);
+            if (listScrollOffset < 0) listScrollOffset = 0;
+            if (listScrollOffset > totalItems - maxVisible) {
+                listScrollOffset = std::max(0, totalItems - maxVisible);
+            }
         }
 
-        // 4.2 Interaction logic
+        // Draw Rows
+        int currentItem = 0;
+        int renderedRows = 0;
+
+        // 1. Draw Directories
+        for (const auto& subDir : dir->directories) {
+            if (currentItem >= listScrollOffset && renderedRows < maxVisible) {
+                DrawText(truncateString(subDir->name, 35).c_str(), startX + 10, yOffset, 20, SKYBLUE);
+                DrawText("-", startX + 350, yOffset, 20, GRAY); // Empty ext for Dirs
+                DrawText(formatSize(subDir->size).c_str(), startX + 450, yOffset, 20, LIGHTGRAY);
+                yOffset += rowHeight;
+                renderedRows++;
+            }
+            currentItem++;
+        }
+
+        // 2. Draw Files
+        for (const auto& file : dir->files) {
+            if (currentItem >= listScrollOffset && renderedRows < maxVisible) {
+                DrawText(truncateString(file.name, 35).c_str(), startX + 10, yOffset, 20, RAYWHITE);
+                DrawText(truncateString(file.extension, 8).c_str(), startX + 350, yOffset, 20, YELLOW);
+                DrawText(formatSize(file.size).c_str(), startX + 450, yOffset, 20, LIGHTGRAY);
+                yOffset += rowHeight;
+                renderedRows++;
+            }
+            currentItem++;
+        }
+    }
+
+public:
+    void render(std::shared_ptr<Directory> view, DirectoryTracker& tracker, int screenWidth, int screenHeight) {
+        sunburstCenter = { 380.0f, screenHeight / 2.0f - 20.0f };
+        sectors.clear();
+
+        if (view) {
+            drawTree(view, 0, 0.0f, 360.0f);
+            drawListView(view, screenWidth, screenHeight);
+            
+            // Draw visual cue for UP navigation
+            if (!view->parent.expired()) {
+                DrawText("UP", sunburstCenter.x - 15, sunburstCenter.y - 10, 20, BLACK);
+            }
+        }
+
+        // Interaction
         if (!tracker.getIsScanning() && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
             Vector2 mouse = GetMousePosition();
-            float dist = Vector2Distance(mouse, center);
-            float angle = atan2(mouse.y - center.y, mouse.x - center.x) * RAD2DEG;
+            float dist = Vector2Distance(mouse, sunburstCenter);
+            float angle = atan2(mouse.y - sunburstCenter.y, mouse.x - sunburstCenter.x) * RAD2DEG;
             if (angle < 0) angle += 360.0f;
 
             int clickedLayer = static_cast<int>(dist / ringWidth);
             
-            for (const auto& sector : sectors) {
-                if (sector.layer == clickedLayer && angle >= sector.startAngle && angle <= sector.endAngle) {
-                    if (sector.layer > 0) tracker.startScan(sector.path);
-                    break;
+            if (clickedLayer == 0 && view && !view->parent.expired()) {
+                tracker.navigateUp(); 
+                listScrollOffset = 0; // Reset scroll on navigate
+            } else {
+                for (const auto& sector : sectors) {
+                    if (sector.layer == clickedLayer && angle >= sector.startAngle && angle <= sector.endAngle) {
+                        if (sector.layer > 0) {
+                            tracker.navigateTo(sector.dir);
+                            listScrollOffset = 0; // Reset scroll on navigate
+                        }
+                        break;
+                    }
                 }
             }
         }
 
-        // 4.3 Draw Slider UI
-        Rectangle sliderBar = { (float)screenWidth/2 - 150, (float)screenHeight - 80, 300, 10 };
+        // Slider UI
+        Rectangle sliderBar = { 230, (float)screenHeight - 80, 300, 10 };
         DrawRectangleRec(sliderBar, DARKGRAY);
-        
-        float stepWidth = sliderBar.width / 5.0f; // 8 - 3 = 5 steps
+        float stepWidth = sliderBar.width / 5.0f; 
         
         if (IsMouseButtonDown(MOUSE_LEFT_BUTTON)) {
             Vector2 mouse = GetMousePosition();
@@ -297,27 +385,25 @@ public:
                 mouse.x >= sliderBar.x && mouse.x <= sliderBar.x + sliderBar.width) {
                 float relativeX = mouse.x - sliderBar.x;
                 maxLayers = 3 + static_cast<int>(round(relativeX / stepWidth));
-                if (maxLayers < 3) maxLayers = 3;
-                if (maxLayers > 8) maxLayers = 8;
+                maxLayers = std::clamp(maxLayers, 3, 8);
             }
         }
 
         float thumbX = sliderBar.x + (maxLayers - 3) * stepWidth;
         DrawCircle(thumbX, sliderBar.y + 5, 10, RED);
-        
         DrawText(TextFormat("Depth Layers: %d", maxLayers), sliderBar.x, sliderBar.y - 25, 20, RAYWHITE);
 
-        // 4.4 Render Progress / Status
+        // Render Progress
         if (tracker.getIsScanning()) {
             DrawRectangle(0, 0, screenWidth, 40, Fade(BLACK, 0.8f));
-            std::string status = "Scanning: " + tracker.getCurrentScanPath();
-            // Truncate path if it's too long for the screen
-            if (status.length() > 100) status = status.substr(0, 97) + "...";
+            std::string status = "Scanning: " + truncateString(tracker.getCurrentScanPath(), 100);
             DrawText(status.c_str(), 10, 10, 20, GREEN);
-        } else if (tree) {
-            DrawText(TextFormat("Current Root: %s", tree->path.c_str()), 10, 10, 20, RAYWHITE);
-            DrawText("Ready. Click a directory wedge to dive in.", 10, 40, 20, LIGHTGRAY);
+        } else if (view) {
+            DrawText(TextFormat("Current Root: %s", view->path.c_str()), 10, 10, 20, RAYWHITE);
         }
+        
+        // Splitter Line
+        DrawLine(730, 40, 730, screenHeight - 40, GRAY);
     }
 };
 
@@ -326,9 +412,9 @@ public:
 // ==========================================
 
 int main() {
-    const int screenWidth = 1000;
+    const int screenWidth = 1400; // Widened for table view
     const int screenHeight = 800;
-    InitWindow(screenWidth, screenHeight, "Windows Directory Tracker");
+    InitWindow(screenWidth, screenHeight, "Windows Directory Tracker - Split View");
     SetTargetFPS(60);
 
     DirectoryTracker tracker;
@@ -340,8 +426,8 @@ int main() {
         BeginDrawing();
         ClearBackground(GetColor(0x181818FF));
 
-        auto currentTree = tracker.getTree();
-        visualizer.render(currentTree, tracker, screenWidth, screenHeight);
+        auto currentView = tracker.getCurrentView();
+        visualizer.render(currentView, tracker, screenWidth, screenHeight);
 
         EndDrawing();
     }
