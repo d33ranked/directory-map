@@ -18,6 +18,7 @@
 #include <istream>
 #include <streambuf>
 #include <stdexcept>
+#include <cstdlib>
 #include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
@@ -46,9 +47,6 @@ std::string truncateString(const std::string& str, size_t maxChars) {
 }
 
 // ---- UTF-8 <-> filesystem path helpers --------------------------------
-// On Windows, path::string() returns the *ANSI code page* (not UTF-8) and
-// path(std::string) reads the ANSI code page. JSON requires UTF-8, so every
-// string that is stored/serialised goes through these helpers instead.
 std::string pathToUtf8(const fs::path& p) {
 #ifdef __cpp_char8_t
     auto u = p.u8string();
@@ -68,8 +66,6 @@ fs::path pathFromUtf8(const std::string& s) {
 
 // Replaces every byte that is not part of a well-formed UTF-8 sequence with
 // U+FFFD so the nlohmann parser accepts the text. Returns replacement count.
-// (Bytes >= 0x80 are never JSON structural characters, so this is safe to run
-// over the whole document before parsing.)
 size_t sanitizeUtf8(std::string& data) {
     std::string out;
     out.reserve(data.size());
@@ -189,13 +185,11 @@ public:
 // 2b. STREAMING JSON LOADER (no DOM, constant memory overhead)
 // ==========================================
 
-// Presents a file as a stream of *valid UTF-8*, repairing bad bytes on the fly
-// in 1 MB chunks. Nothing but the current chunk is ever held in memory.
 class Utf8FilterBuf : public std::streambuf {
     static constexpr size_t CHUNK = 1u << 20;
     std::ifstream file;
-    std::string carry;   // incomplete UTF-8 sequence held back from the previous chunk
-    std::string buf;     // current sanitised chunk exposed to the reader
+    std::string carry;
+    std::string buf;
     bool first = true;
     bool eof = false;
     size_t repaired = 0;
@@ -224,11 +218,10 @@ protected:
                 if (file.eof() || file.gcount() == 0) eof = true;
             }
 
-            // Don't split a multi-byte character across chunks.
             if (!eof) {
                 for (size_t k = 1; k <= 3 && k <= chunk.size(); ++k) {
                     unsigned char c = static_cast<unsigned char>(chunk[chunk.size() - k]);
-                    if ((c & 0xC0) == 0x80) continue;           // continuation byte, keep looking back
+                    if ((c & 0xC0) == 0x80) continue;
                     if (c >= 0xC0) {
                         size_t need = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2);
                         if (need > k) {
@@ -245,7 +238,7 @@ protected:
 
             repaired += sanitizeUtf8(chunk);
             buf.swap(chunk);
-            if (buf.empty()) continue;   // nothing usable yet, read more (or hit EOF above)
+            if (buf.empty()) continue;
 
             char* p = &buf[0];
             setg(p, p, p + buf.size());
@@ -254,15 +247,12 @@ protected:
     }
 };
 
-// SAX handler that builds the Directory tree directly while the JSON is being
-// parsed. Expected shape (same as saveToDisk writes):
-//   {name,path,size,lastModified,files:[{name,extension,size,lastModified}],directories:[...]}
 class TreeSaxHandler : public nlohmann::json_sax<json> {
     enum class Ctx { DirObj, FilesArr, FileObj, DirsArr, Ignore };
     struct Frame {
         Ctx ctx;
-        std::shared_ptr<Directory> dir; // owning dir for DirObj / FilesArr / DirsArr / FileObj
-        File file;                      // only used by FileObj
+        std::shared_ptr<Directory> dir;
+        File file;
     };
 
     std::vector<Frame> stack;
@@ -309,7 +299,7 @@ public:
 
     bool start_object(std::size_t) override {
         if (stack.empty()) {
-            if (root) return false;                       // second top-level value
+            if (root) return false;
             root = std::make_shared<Directory>();
             stack.push_back({Ctx::DirObj, root, {}});
             return true;
@@ -323,7 +313,7 @@ public:
         } else if (top.ctx == Ctx::FilesArr) {
             stack.push_back({Ctx::FileObj, top.dir, {}});
         } else {
-            stack.push_back({Ctx::Ignore, nullptr, {}});  // unknown nested object: skip it
+            stack.push_back({Ctx::Ignore, nullptr, {}});
         }
         return true;
     }
@@ -337,7 +327,7 @@ public:
     }
 
     bool start_array(std::size_t) override {
-        if (stack.empty()) return false;                  // top level must be an object
+        if (stack.empty()) return false;
         Frame& top = stack.back();
         if (top.ctx == Ctx::DirObj && curKey == "files")            stack.push_back({Ctx::FilesArr, top.dir, {}});
         else if (top.ctx == Ctx::DirObj && curKey == "directories") stack.push_back({Ctx::DirsArr, top.dir, {}});
@@ -615,8 +605,6 @@ public:
                     }
                 }
 
-                // Write to a temp file first so a crash mid-save can never leave
-                // a truncated JSON file that gets auto-loaded on the next start.
                 out.flush();
                 bool ok = out.good();
                 out.close();
@@ -631,8 +619,6 @@ public:
         }).detach();
     }
 
-    // Streams the JSON file straight into a Directory tree (no intermediate
-    // json DOM, no whole-file string). Throws on any failure.
     std::shared_ptr<Directory> parseTreeFile(const std::string& filepath) {
         Utf8FilterBuf filter(filepath);
         if (!filter.isOpen()) throw std::runtime_error("cannot open " + filepath);
@@ -655,8 +641,6 @@ public:
         return handler.root;
     }
 
-    // If the file is missing/corrupt and fallbackScanPath is non-empty, a fresh
-    // scan of that path is started instead.
     void loadFromDisk(const std::string& filepath, const std::string& fallbackScanPath = "") {
         if (isSaving || isLoading || isScanning) return;
         isLoading = true;
@@ -670,7 +654,7 @@ public:
                 currentView = newTree;
                 loaded = true;
             } catch (const std::bad_alloc&) {
-                std::cerr << "Load failed: out of memory (is this a 32-bit build?)\n";
+                std::cerr << "Load failed: out of memory\n";
             } catch (const std::exception& e) {
                 std::cerr << "Load failed safely: " << e.what() << '\n';
             }
@@ -753,7 +737,7 @@ class Visualizer {
         }
     }
 
-    void drawListView(std::shared_ptr<Directory> dir, int screenWidth, int screenHeight) {
+    void drawListView(std::shared_ptr<Directory> dir, DirectoryTracker& tracker, int screenWidth, int screenHeight) {
         int startX = 750;
         int listWidth = screenWidth - startX - 20;
         
@@ -767,7 +751,10 @@ class Visualizer {
         int totalItems = dir->directories.size() + dir->files.size();
         int maxVisible = (screenHeight - 160) / rowHeight;
         
-        if (GetMouseX() > startX) {
+        Vector2 mouse = GetMousePosition();
+        bool isMouseInList = (mouse.x >= startX && mouse.x <= startX + listWidth && mouse.y >= 90 && mouse.y <= screenHeight - 60);
+
+        if (isMouseInList) {
             listScrollOffset -= static_cast<int>(GetMouseWheelMove() * 3);
             if (listScrollOffset < 0) listScrollOffset = 0;
             if (listScrollOffset > totalItems - maxVisible) {
@@ -776,23 +763,41 @@ class Visualizer {
         }
 
         int currentItem = 0, renderedRows = 0;
-        for (const auto& subDir : dir->directories) {
+
+        auto renderRow = [&](const std::string& name, const std::string& ext, const std::string& sizeStr, bool isDir, std::shared_ptr<Directory> targetDir) {
             if (currentItem >= listScrollOffset && renderedRows < maxVisible) {
-                DrawText(truncateString(subDir->name, 35).c_str(), startX + 10, yOffset, 20, SKYBLUE);
-                DrawText("-", startX + 350, yOffset, 20, GRAY);
-                DrawText(formatSize(subDir->size).c_str(), startX + 450, yOffset, 20, LIGHTGRAY);
-                yOffset += rowHeight; renderedRows++;
+                Rectangle rowRect = { (float)startX + 5, (float)yOffset - 2, (float)listWidth - 10, (float)(rowHeight - 2) };
+                bool hovered = isMouseInList && CheckCollisionPointRec(mouse, rowRect);
+                bool pressed = hovered && IsMouseButtonDown(MOUSE_LEFT_BUTTON);
+                bool clicked = hovered && IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+
+                if (pressed) {
+                    DrawRectangleRec(rowRect, Fade(LIGHTGRAY, 0.35f));
+                } else if (hovered) {
+                    DrawRectangleRec(rowRect, Fade(LIGHTGRAY, 0.15f));
+                }
+
+                if (isDir && clicked) {
+                    tracker.navigateTo(targetDir);
+                    listScrollOffset = 0;
+                }
+
+                Color nameColor = isDir ? SKYBLUE : RAYWHITE;
+                DrawText(truncateString(name, 35).c_str(), startX + 10, yOffset, 20, nameColor);
+                DrawText(ext.c_str(), startX + 350, yOffset, 20, isDir ? GRAY : YELLOW);
+                DrawText(sizeStr.c_str(), startX + 450, yOffset, 20, LIGHTGRAY);
+
+                yOffset += rowHeight; 
+                renderedRows++;
             }
             currentItem++;
+        };
+
+        for (const auto& subDir : dir->directories) {
+            renderRow(subDir->name, "-", formatSize(subDir->size), true, subDir);
         }
         for (const auto& file : dir->files) {
-            if (currentItem >= listScrollOffset && renderedRows < maxVisible) {
-                DrawText(truncateString(file.name, 35).c_str(), startX + 10, yOffset, 20, RAYWHITE);
-                DrawText(truncateString(file.extension, 8).c_str(), startX + 350, yOffset, 20, YELLOW);
-                DrawText(formatSize(file.size).c_str(), startX + 450, yOffset, 20, LIGHTGRAY);
-                yOffset += rowHeight; renderedRows++;
-            }
-            currentItem++;
+            renderRow(file.name, truncateString(file.extension, 8), formatSize(file.size), false, nullptr);
         }
     }
 
@@ -803,13 +808,12 @@ public:
 
         if (view) {
             drawTree(view, 0, 0.0f, 360.0f);
-            drawListView(view, screenWidth, screenHeight);
+            drawListView(view, tracker, screenWidth, screenHeight);
             if (!view->parent.expired()) DrawText("UP", sunburstCenter.x - 15, sunburstCenter.y - 10, 20, BLACK);
         }
 
         bool lockUI = tracker.getIsScanning() || tracker.getIsSaving() || tracker.getIsLoading();
 
-        // Draw Save/Load Buttons
         Rectangle btnSave = { (float)screenWidth - 200, 15, 80, 30 };
         Rectangle btnLoad = { (float)screenWidth - 100, 15, 80, 30 };
         DrawRectangleRec(btnSave, lockUI ? GRAY : MAROON);
@@ -845,7 +849,6 @@ public:
             }
         }
 
-        // Depth Slider
         Rectangle sliderBar = { 230, (float)screenHeight - 80, 300, 10 };
         DrawRectangleRec(sliderBar, DARKGRAY);
         float stepWidth = sliderBar.width / 5.0f; 
@@ -861,7 +864,6 @@ public:
         DrawCircle(thumbX, sliderBar.y + 5, 10, RED);
         DrawText(TextFormat("Depth Layers: %d", maxLayers), sliderBar.x, sliderBar.y - 25, 20, RAYWHITE);
 
-        // Render Status Banners
         if (tracker.getIsSaving()) {
             DrawRectangle(0, 0, screenWidth, 40, Fade(BLUE, 0.8f));
             DrawText("Saving heavily nested tree to data/dir_tree.json...", 10, 10, 20, RAYWHITE);
@@ -886,16 +888,29 @@ public:
 int main() {
     const int screenWidth = 1400;
     const int screenHeight = 800;
-    InitWindow(screenWidth, screenHeight, "Windows Directory Tracker - Stream Engine");
+
+    // Automatically resolve the user's home directory cross-platform
+    std::string defaultRoot;
+#if defined(_WIN32) || defined(_WIN64)
+    const char* userProfile = std::getenv("USERPROFILE");
+    defaultRoot = userProfile ? userProfile : "C:\\";
+    const char* windowTitle = "Directory Tracker - Stream Engine (Windows)";
+#else
+    const char* homeDir = std::getenv("HOME");
+    defaultRoot = homeDir ? homeDir : fs::current_path().string();
+    const char* windowTitle = "Directory Tracker - Stream Engine (Linux)";
+#endif
+
+    InitWindow(screenWidth, screenHeight, windowTitle);
     SetTargetFPS(60);
 
     DirectoryTracker tracker;
     Visualizer visualizer;
 
     if (fs::exists("data/dir_tree.json")) {
-        tracker.loadFromDisk("data/dir_tree.json", "C:\\");
+        tracker.loadFromDisk("data/dir_tree.json", defaultRoot);
     } else {
-        tracker.startScan("C:\\");
+        tracker.startScan(defaultRoot);
     }
 
     while (!WindowShouldClose()) {
