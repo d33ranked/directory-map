@@ -24,5 +24,11 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(json)
 
-add_executable(DirTracker main.cpp)
+add_executable(DirTracker 
+    main.cpp
+    src/DirectoryTracker.cpp
+    src/Visualizer.cpp
+)
+
+target_include_directories(DirTracker PRIVATE src)
 target_link_libraries(DirTracker PRIVATE raylib nlohmann_json::nlohmann_json)
