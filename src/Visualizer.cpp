@@ -69,7 +69,7 @@ void Visualizer::drawListView(std::shared_ptr<Directory> dir, DirectoryTracker& 
     
     int yOffset = 100;
     int rowHeight = 25;
-    int totalItems = dir->directories.size() + dir->files.size();
+    int totalItems = static_cast<int>(dir->directories.size() + dir->files.size());
     int maxVisible = (screenHeight - 160) / rowHeight;
     
     Vector2 mouse = GetMousePosition();
@@ -126,27 +126,60 @@ void Visualizer::render(std::shared_ptr<Directory> view, DirectoryTracker& track
     sunburstCenter = { 380.0f, screenHeight / 2.0f - 20.0f };
     sectors.clear();
 
+    if (statusTimer > 0.0f) {
+        statusTimer -= GetFrameTime();
+        if (statusTimer <= 0.0f) {
+            statusTimer = 0.0f;
+            statusBanner.clear();
+        }
+    }
+
     if (view) {
         drawTree(view, 0, 0.0f, 360.0f);
         drawListView(view, tracker, screenWidth, screenHeight);
         if (!view->parent.expired()) DrawText("UP", sunburstCenter.x - 15, sunburstCenter.y - 10, 20, BLACK);
     }
 
-    bool lockUI = tracker.getIsScanning() || tracker.getIsSaving() || tracker.getIsLoading();
+    bool lockUI = tracker.getIsScanning();
+    bool canGoBack = !lockUI && view && !view->parent.expired();
 
-    Rectangle btnSave = { (float)screenWidth - 200, 15, 80, 30 };
-    Rectangle btnLoad = { (float)screenWidth - 100, 15, 80, 30 };
-    DrawRectangleRec(btnSave, lockUI ? GRAY : MAROON);
-    DrawRectangleRec(btnLoad, lockUI ? GRAY : DARKGREEN);
-    DrawText("Save", btnSave.x + 15, btnSave.y + 5, 20, RAYWHITE);
-    DrawText("Load", btnLoad.x + 15, btnLoad.y + 5, 20, RAYWHITE);
+    Rectangle btnBack = { 10.0f, 10.0f, 75.0f, 26.0f };
+    Rectangle btnCopy = { (float)screenWidth - 200.0f, 15.0f, 80.0f, 30.0f };
+    Rectangle btnPaste = { (float)screenWidth - 100.0f, 15.0f, 80.0f, 30.0f };
+
+    DrawRectangleRec(btnBack, canGoBack ? DARKBLUE : GRAY);
+    DrawText("Back", static_cast<int>(btnBack.x + 15.0f), static_cast<int>(btnBack.y + 3.0f), 20, RAYWHITE);
+
+    DrawRectangleRec(btnCopy, lockUI ? GRAY : MAROON);
+    DrawRectangleRec(btnPaste, lockUI ? GRAY : DARKGREEN);
+    DrawText("Copy", static_cast<int>(btnCopy.x + 17.0f), static_cast<int>(btnCopy.y + 5.0f), 20, RAYWHITE);
+    DrawText("Paste", static_cast<int>(btnPaste.x + 14.0f), static_cast<int>(btnPaste.y + 5.0f), 20, RAYWHITE);
 
     if (!lockUI && IsMouseButtonPressed(MOUSE_LEFT_BUTTON)) {
         Vector2 mouse = GetMousePosition();
-        
-        if (CheckCollisionPointRec(mouse, btnSave)) tracker.saveToDisk("data/dir_tree.json");
-        else if (CheckCollisionPointRec(mouse, btnLoad)) tracker.loadFromDisk("data/dir_tree.json");
-        else {
+
+        if (canGoBack && CheckCollisionPointRec(mouse, btnBack)) {
+            tracker.navigateUp();
+            listScrollOffset = 0;
+        } else if (CheckCollisionPointRec(mouse, btnCopy)) {
+            tracker.copyCurrentPath();
+            std::string copied = tracker.getCopiedPath();
+            if (!copied.empty()) {
+                SetClipboardText(copied.c_str());
+                statusBanner = "Copied: " + truncateString(copied, 45);
+                statusTimer = 3.0f;
+            }
+        } else if (CheckCollisionPointRec(mouse, btnPaste)) {
+            const char* clip = GetClipboardText();
+            std::string clipStr = clip ? std::string(clip) : std::string();
+            std::string msg;
+            tracker.pastePath(clipStr, &msg);
+            listScrollOffset = 0;
+            if (!msg.empty()) {
+                statusBanner = msg;
+                statusTimer = 3.0f;
+            }
+        } else {
             float dist = Vector2Distance(mouse, sunburstCenter);
             float angle = atan2(mouse.y - sunburstCenter.y, mouse.x - sunburstCenter.x) * RAD2DEG;
             if (angle < 0) angle += 360.0f;
@@ -184,17 +217,15 @@ void Visualizer::render(std::shared_ptr<Directory> view, DirectoryTracker& track
     DrawCircle(thumbX, sliderBar.y + 5, 10, RED);
     DrawText(TextFormat("Depth Layers: %d", maxLayers), sliderBar.x, sliderBar.y - 25, 20, RAYWHITE);
 
-    if (tracker.getIsSaving()) {
-        DrawRectangle(0, 0, screenWidth, 40, Fade(BLUE, 0.8f));
-        DrawText("Saving heavily nested tree to data/dir_tree.json...", 10, 10, 20, RAYWHITE);
-    } else if (tracker.getIsLoading()) {
-        DrawRectangle(0, 0, screenWidth, 40, Fade(ORANGE, 0.8f));
-        DrawText("Loading tree from data/dir_tree.json...", 10, 10, 20, RAYWHITE);
-    } else if (tracker.getIsScanning()) {
+    if (tracker.getIsScanning()) {
         DrawRectangle(0, 0, screenWidth, 40, Fade(BLACK, 0.8f));
-        DrawText(("Scanning: " + truncateString(tracker.getCurrentScanPath(), 90)).c_str(), 10, 10, 20, GREEN);
+        DrawText(("Scanning: " + truncateString(tracker.getCurrentScanPath(), 80)).c_str(), 95, 13, 20, GREEN);
     } else if (view) {
-        DrawText(TextFormat("current directory: %s", view->path.c_str()), 10, 10, 20, RAYWHITE);
+        DrawText(view->path.c_str(), 95, 13, 20, RAYWHITE);
+    }
+
+    if (!statusBanner.empty()) {
+        DrawText(statusBanner.c_str(), 95, 40, 18, YELLOW);
     }
     
     DrawLine(730, 40, 730, screenHeight - 40, GRAY);

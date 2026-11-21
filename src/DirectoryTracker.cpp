@@ -1,8 +1,18 @@
+#if defined(_WIN32) || defined(_WIN64)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include "DirectoryTracker.hpp"
 #include <cstdio>
-#include <fstream>
 #include <algorithm>
 #include <iostream>
+
 
 std::string formatSize(uintmax_t bytes) {
     const char* units[] = {"B", "KB", "MB", "GB", "TB", "PB"};
@@ -39,66 +49,11 @@ fs::path pathFromUtf8(const std::string& s) {
 #endif
 }
 
-size_t sanitizeUtf8(std::string& data) {
-    std::string out;
-    out.reserve(data.size());
-    size_t bad = 0, i = 0, n = data.size();
-    auto cont = [&](size_t k) {
-        return k < n && (static_cast<unsigned char>(data[k]) & 0xC0) == 0x80;
-    };
-    while (i < n) {
-        unsigned char c = static_cast<unsigned char>(data[i]);
-        size_t len = 0;
-        if (c < 0x80) len = 1;
-        else if (c >= 0xC2 && c <= 0xDF && cont(i + 1)) len = 2;
-        else if (c >= 0xE0 && c <= 0xEF && cont(i + 1) && cont(i + 2)) {
-            unsigned char c1 = static_cast<unsigned char>(data[i + 1]);
-            bool overlong = (c == 0xE0 && c1 < 0xA0);
-            bool surrogate = (c == 0xED && c1 >= 0xA0);
-            if (!overlong && !surrogate) len = 3;
-        } else if (c >= 0xF0 && c <= 0xF4 && cont(i + 1) && cont(i + 2) && cont(i + 3)) {
-            unsigned char c1 = static_cast<unsigned char>(data[i + 1]);
-            bool overlong = (c == 0xF0 && c1 < 0x90);
-            bool tooBig = (c == 0xF4 && c1 >= 0x90);
-            if (!overlong && !tooBig) len = 4;
-        }
-        if (len) { out.append(data, i, len); i += len; }
-        else { out += "\xEF\xBF\xBD"; ++bad; ++i; }
-    }
-    if (bad) data.swap(out);
-    return bad;
-}
-
 long long getTimestamp(const fs::path& p) {
     std::error_code ec;
     auto ftime = fs::last_write_time(p, ec);
     if (ec) return 0;
     return std::chrono::duration_cast<std::chrono::seconds>(ftime.time_since_epoch()).count();
-}
-
-std::string escapeJSON(const std::string& s) {
-    std::string result;
-    result.reserve(s.length() + 10);
-    for (char c : s) {
-        switch (c) {
-            case '"': result += "\\\""; break;
-            case '\\': result += "\\\\"; break;
-            case '\b': result += "\\b"; break;
-            case '\f': result += "\\f"; break;
-            case '\n': result += "\\n"; break;
-            case '\r': result += "\\r"; break;
-            case '\t': result += "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 32) {
-                    char buf[10];
-                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
-                    result += buf;
-                } else {
-                    result += c;
-                }
-        }
-    }
-    return result;
 }
 
 File DefaultFileScanner::scan(const fs::directory_entry& entry) {
@@ -118,140 +73,6 @@ File DefaultFileScanner::scan(const fs::directory_entry& entry) {
 
 ScannerManager::ScannerManager() { defaultScanner = std::make_shared<DefaultFileScanner>(); }
 File ScannerManager::scanFile(const fs::directory_entry& entry) { return defaultScanner->scan(entry); }
-
-Utf8FilterBuf::Utf8FilterBuf(const std::string& utf8Path)
-    : file(pathFromUtf8(utf8Path), std::ios::binary) {}
-
-bool Utf8FilterBuf::isOpen() const { return file.is_open(); }
-size_t Utf8FilterBuf::repairedBytes() const { return repaired; }
-
-Utf8FilterBuf::int_type Utf8FilterBuf::underflow() {
-    if (gptr() < egptr()) return traits_type::to_int_type(*gptr());
-
-    while (true) {
-        if (eof && carry.empty()) return traits_type::eof();
-
-        std::string chunk = std::move(carry);
-        carry.clear();
-        if (!eof) {
-            size_t old = chunk.size();
-            chunk.resize(old + CHUNK);
-            file.read(&chunk[old], static_cast<std::streamsize>(CHUNK));
-            chunk.resize(old + static_cast<size_t>(file.gcount()));
-            if (file.eof() || file.gcount() == 0) eof = true;
-        }
-
-        if (!eof) {
-            for (size_t k = 1; k <= 3 && k <= chunk.size(); ++k) {
-                unsigned char c = static_cast<unsigned char>(chunk[chunk.size() - k]);
-                if ((c & 0xC0) == 0x80) continue;
-                if (c >= 0xC0) {
-                    size_t need = c >= 0xF0 ? 4 : (c >= 0xE0 ? 3 : 2);
-                    if (need > k) {
-                        carry = chunk.substr(chunk.size() - k);
-                        chunk.resize(chunk.size() - k);
-                    }
-                }
-                break;
-            }
-        }
-
-        if (first && chunk.size() >= 3 && chunk.compare(0, 3, "\xEF\xBB\xBF") == 0) chunk.erase(0, 3);
-        if (!chunk.empty()) first = false;
-
-        repaired += sanitizeUtf8(chunk);
-        buf.swap(chunk);
-        if (buf.empty()) continue;
-
-        char* p = &buf[0];
-        setg(p, p, p + buf.size());
-        return traits_type::to_int_type(*gptr());
-    }
-}
-
-bool TreeSaxHandler::setString(const std::string& v) {
-    if (stack.empty()) return false;
-    Frame& f = stack.back();
-    if (f.ctx == Ctx::DirObj) {
-        if (curKey == "name") f.dir->name = v;
-        else if (curKey == "path") f.dir->path = v;
-    } else if (f.ctx == Ctx::FileObj) {
-        if (curKey == "name") f.file.name = v;
-        else if (curKey == "extension") f.file.extension = v;
-    }
-    return true;
-}
-
-bool TreeSaxHandler::setNumber(long long v) {
-    if (stack.empty()) return false;
-    Frame& f = stack.back();
-    if (f.ctx == Ctx::DirObj) {
-        if (curKey == "size") f.dir->size = static_cast<uintmax_t>(v);
-        else if (curKey == "lastModified") f.dir->lastModified = v;
-    } else if (f.ctx == Ctx::FileObj) {
-        if (curKey == "size") f.file.size = static_cast<uintmax_t>(v);
-        else if (curKey == "lastModified") f.file.lastModified = v;
-    }
-    return true;
-}
-
-bool TreeSaxHandler::null() { return true; }
-bool TreeSaxHandler::boolean(bool) { return true; }
-bool TreeSaxHandler::number_integer(json::number_integer_t v) { return setNumber(static_cast<long long>(v)); }
-bool TreeSaxHandler::number_unsigned(json::number_unsigned_t v) { return setNumber(static_cast<long long>(v)); }
-bool TreeSaxHandler::number_float(json::number_float_t v, const std::string&) { return setNumber(static_cast<long long>(v)); }
-bool TreeSaxHandler::string(std::string& v) { return setString(v); }
-bool TreeSaxHandler::binary(json::binary_t&) { return true; }
-bool TreeSaxHandler::key(std::string& k) { curKey = k; return true; }
-
-bool TreeSaxHandler::start_object(std::size_t) {
-    if (stack.empty()) {
-        if (root) return false;
-        root = std::make_shared<Directory>();
-        stack.push_back({Ctx::DirObj, root, {}});
-        return true;
-    }
-    Frame& top = stack.back();
-    if (top.ctx == Ctx::DirsArr) {
-        auto sub = std::make_shared<Directory>();
-        sub->parent = top.dir;
-        top.dir->directories.push_back(sub);
-        stack.push_back({Ctx::DirObj, sub, {}});
-    } else if (top.ctx == Ctx::FilesArr) {
-        stack.push_back({Ctx::FileObj, top.dir, {}});
-    } else {
-        stack.push_back({Ctx::Ignore, nullptr, {}});
-    }
-    return true;
-}
-
-bool TreeSaxHandler::end_object() {
-    if (stack.empty()) return false;
-    Frame f = std::move(stack.back());
-    stack.pop_back();
-    if (f.ctx == Ctx::FileObj) f.dir->files.push_back(std::move(f.file));
-    return true;
-}
-
-bool TreeSaxHandler::start_array(std::size_t) {
-    if (stack.empty()) return false;
-    Frame& top = stack.back();
-    if (top.ctx == Ctx::DirObj && curKey == "files")            stack.push_back({Ctx::FilesArr, top.dir, {}});
-    else if (top.ctx == Ctx::DirObj && curKey == "directories") stack.push_back({Ctx::DirsArr, top.dir, {}});
-    else                                                        stack.push_back({Ctx::Ignore, nullptr, {}});
-    return true;
-}
-
-bool TreeSaxHandler::end_array() {
-    if (stack.empty()) return false;
-    stack.pop_back();
-    return true;
-}
-
-bool TreeSaxHandler::parse_error(std::size_t position, const std::string& lastToken, const json::exception& ex) {
-    error = std::string(ex.what()) + " (byte " + std::to_string(position) + ", near '" + lastToken + "')";
-    return false;
-}
 
 void DirectoryTracker::computeSizesAndSort(std::shared_ptr<Directory> dir) {
     uintmax_t totalSize = 0;
@@ -307,10 +128,44 @@ void DirectoryTracker::buildTreeInternal(std::shared_ptr<Directory> rootDir) {
     computeSizesAndSort(rootDir);
 }
 
+std::shared_ptr<Directory> DirectoryTracker::findDirectoryByPath(const std::string& targetPath) {
+    std::lock_guard<std::mutex> lock(treeMutex);
+    if (!masterTree) return nullptr;
+
+    fs::path targetFs = pathFromUtf8(targetPath).lexically_normal().make_preferred();
+    std::shared_ptr<Directory> equivalentMatch = nullptr;
+
+    std::vector<std::shared_ptr<Directory>> stack;
+    stack.push_back(masterTree);
+
+    while (!stack.empty()) {
+        auto current = stack.back();
+        stack.pop_back();
+
+        fs::path currentFs = pathFromUtf8(current->path).lexically_normal().make_preferred();
+        if (currentFs == targetFs) {
+            return current;
+        }
+
+        if (!equivalentMatch) {
+            std::error_code ec;
+            if (fs::equivalent(currentFs, targetFs, ec)) {
+                equivalentMatch = current;
+            }
+        }
+
+        for (const auto& sub : current->directories) {
+            stack.push_back(sub);
+        }
+    }
+
+    return equivalentMatch;
+}
+
 void DirectoryTracker::pollFileSystem() {
     while (isPolling) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        if (isScanning || isLoading || isSaving || !masterTree) continue;
+        if (isScanning || !masterTree) continue;
 
         std::vector<std::shared_ptr<Directory>> dirsToCheck;
         {
@@ -327,7 +182,7 @@ void DirectoryTracker::pollFileSystem() {
         }
 
         for (auto& dir : dirsToCheck) {
-            if (!isPolling || isScanning || isSaving) break;
+            if (!isPolling || isScanning) break;
             
             long long currentModified = getTimestamp(pathFromUtf8(dir->path));
             if (currentModified != 0 && currentModified != dir->lastModified) {
@@ -394,17 +249,20 @@ DirectoryTracker::~DirectoryTracker() {
 }
 
 void DirectoryTracker::startScan(const std::string& path) {
-    if (isScanning || isSaving || isLoading) return;
+    if (isScanning) return;
     isScanning = true;
     setCurrentScanPath("Initializing...");
     if (workerThread.joinable()) workerThread.join();
 
-    workerThread = std::thread([this, path]() {
+    fs::path osPath = pathFromUtf8(path).make_preferred();
+    std::string normalizedPath = pathToUtf8(osPath);
+
+    workerThread = std::thread([this, osPath, normalizedPath]() {
         auto rootDir = std::make_shared<Directory>();
-        rootDir->name = pathToUtf8(pathFromUtf8(path).filename());
-        if (rootDir->name.empty()) rootDir->name = path;
-        rootDir->path = path;
-        rootDir->lastModified = getTimestamp(pathFromUtf8(path));
+        rootDir->name = pathToUtf8(osPath.filename());
+        if (rootDir->name.empty()) rootDir->name = normalizedPath;
+        rootDir->path = normalizedPath;
+        rootDir->lastModified = getTimestamp(osPath);
 
         buildTreeInternal(rootDir);
         
@@ -415,141 +273,7 @@ void DirectoryTracker::startScan(const std::string& path) {
     });
 }
 
-void DirectoryTracker::saveToDisk(const std::string& filepath) {
-    if (isSaving || isLoading || isScanning) return;
-    isSaving = true;
-
-    std::thread([this, filepath]() {
-        try {
-            fs::path outPath = pathFromUtf8(filepath);
-            fs::path tmpPath = outPath;
-            tmpPath += ".tmp";
-            if (outPath.has_parent_path()) {
-                std::error_code ec;
-                fs::create_directories(outPath.parent_path(), ec);
-            }
-
-            std::ofstream out(tmpPath, std::ios::binary);
-            if (!out.is_open()) {
-                std::cerr << "Failed to open output file\n";
-                isSaving = false;
-                return;
-            }
-
-            std::lock_guard<std::mutex> lock(treeMutex);
-            if (!masterTree) {
-                out << "{}";
-                out.close();
-                std::error_code ec;
-                fs::rename(tmpPath, outPath, ec);
-                isSaving = false;
-                return;
-            }
-
-            struct StackItem {
-                std::shared_ptr<Directory> dir;
-                int state;
-                size_t index;
-            };
-
-            std::vector<StackItem> stack;
-            stack.push_back({masterTree, 0, 0});
-
-            while (!stack.empty()) {
-                auto& current = stack.back();
-                if (current.state == 0) {
-                    out << "{\"name\":\"" << escapeJSON(current.dir->name) << "\",";
-                    out << "\"path\":\"" << escapeJSON(current.dir->path) << "\",";
-                    out << "\"size\":" << current.dir->size << ",";
-                    out << "\"lastModified\":" << current.dir->lastModified << ",";
-                    out << "\"files\":[";
-
-                    for (size_t i = 0; i < current.dir->files.size(); ++i) {
-                        const auto& f = current.dir->files[i];
-                        out << "{\"name\":\"" << escapeJSON(f.name) 
-                            << "\",\"extension\":\"" << escapeJSON(f.extension) 
-                            << "\",\"size\":" << f.size 
-                            << ",\"lastModified\":" << f.lastModified << "}";
-                        if (i + 1 < current.dir->files.size()) out << ",";
-                    }
-                    out << "],\"directories\":[";
-                    current.state = 1;
-                } else if (current.state == 1) {
-                    if (current.index < current.dir->directories.size()) {
-                        if (current.index > 0) out << ",";
-                        auto nextDir = current.dir->directories[current.index];
-                        current.index++;
-                        stack.push_back({nextDir, 0, 0});
-                    } else {
-                        current.state = 2;
-                    }
-                } else if (current.state == 2) {
-                    out << "]}";
-                    stack.pop_back();
-                }
-            }
-
-            out.flush();
-            bool ok = out.good();
-            out.close();
-            std::error_code ec;
-            if (ok) fs::rename(tmpPath, outPath, ec);
-            else    fs::remove(tmpPath, ec);
-            if (!ok || ec) std::cerr << "Save failed: could not finalise file\n";
-        } catch (const std::exception& e) {
-            std::cerr << "Save failed safely: " << e.what() << '\n';
-        }
-        isSaving = false;
-    }).detach();
-}
-
-std::shared_ptr<Directory> DirectoryTracker::parseTreeFile(const std::string& filepath) {
-    Utf8FilterBuf filter(filepath);
-    if (!filter.isOpen()) throw std::runtime_error("cannot open " + filepath);
-    std::istream in(&filter);
-
-    TreeSaxHandler handler;
-    bool ok = json::sax_parse(in, &handler);
-    if (!ok) {
-        throw std::runtime_error(handler.error.empty() ? "unexpected JSON structure" : handler.error);
-    }
-    if (!handler.root || handler.root->path.empty()) {
-        throw std::runtime_error("file does not contain a directory tree");
-    }
-    if (filter.repairedBytes()) {
-        std::cerr << "Load: replaced " << filter.repairedBytes()
-                  << " invalid UTF-8 byte(s). Re-save to write a clean file.\n";
-    }
-
-    computeSizesAndSort(handler.root);
-    return handler.root;
-}
-
-void DirectoryTracker::loadFromDisk(const std::string& filepath, const std::string& fallbackScanPath) {
-    if (isSaving || isLoading || isScanning) return;
-    isLoading = true;
-
-    std::thread([this, filepath, fallbackScanPath]() {
-        bool loaded = false;
-        try {
-            auto newTree = parseTreeFile(filepath);
-            std::lock_guard<std::mutex> lock(treeMutex);
-            masterTree = newTree;
-            currentView = newTree;
-            loaded = true;
-        } catch (const std::bad_alloc&) {
-            std::cerr << "Load failed: out of memory\n";
-        } catch (const std::exception& e) {
-            std::cerr << "Load failed safely: " << e.what() << '\n';
-        }
-        isLoading = false;
-        if (!loaded && !fallbackScanPath.empty()) startScan(fallbackScanPath);
-    }).detach();
-}
-
 bool DirectoryTracker::getIsScanning() const { return isScanning; }
-bool DirectoryTracker::getIsSaving() const { return isSaving; }
-bool DirectoryTracker::getIsLoading() const { return isLoading; }
 
 void DirectoryTracker::navigateTo(std::shared_ptr<Directory> target) {
     std::lock_guard<std::mutex> lock(treeMutex);
@@ -561,6 +285,79 @@ void DirectoryTracker::navigateUp() {
     if (currentView && !currentView->parent.expired()) {
         currentView = currentView->parent.lock();
     }
+}
+
+void DirectoryTracker::copyCurrentPath() {
+    std::string activePath;
+    {
+        std::lock_guard<std::mutex> lock(treeMutex);
+        if (currentView && !currentView->path.empty()) {
+            activePath = currentView->path;
+        }
+    }
+    if (activePath.empty()) {
+        activePath = getCurrentScanPath();
+    }
+    if (activePath.empty()) return;
+
+    fs::path preferred = pathFromUtf8(activePath).lexically_normal().make_preferred();
+    std::string formatted = pathToUtf8(preferred);
+
+    {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        copiedPath = formatted;
+    }
+}
+
+bool DirectoryTracker::pastePath(const std::string& rawPath, std::string* statusMessage) {
+    if (isScanning) {
+        if (statusMessage) *statusMessage = "Busy scanning...";
+        return false;
+    }
+
+    std::string candidate = rawPath;
+    if (candidate.empty()) {
+        candidate = getCopiedPath();
+    }
+    if (candidate.empty()) {
+        if (statusMessage) *statusMessage = "No path to paste";
+        return false;
+    }
+
+    // Strip surrounding quotes if the user copied a quoted path
+    if (candidate.size() >= 2 &&
+        ((candidate.front() == '"' && candidate.back() == '"') ||
+         (candidate.front() == '\'' && candidate.back() == '\''))) {
+        candidate = candidate.substr(1, candidate.size() - 2);
+    }
+
+    fs::path osPath = pathFromUtf8(candidate).lexically_normal().make_preferred();
+    std::error_code ec;
+    if (osPath.empty() || !fs::exists(osPath, ec) || !fs::is_directory(osPath, ec)) {
+        if (statusMessage) *statusMessage = "Invalid directory path";
+        return false;
+    }
+
+    std::string formatted = pathToUtf8(osPath);
+    {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        copiedPath = formatted;
+    }
+
+    if (auto existingDir = findDirectoryByPath(formatted)) {
+        navigateTo(existingDir);
+        if (statusMessage) *statusMessage = "Switched to: " + truncateString(formatted, 45);
+        return true;
+    }
+
+    startScan(formatted);
+    if (statusMessage) *statusMessage = "Scanning: " + truncateString(formatted, 45);
+    return true;
+}
+
+std::string DirectoryTracker::getCopiedPath() {
+    std::lock_guard<std::mutex> lock(progressMutex);
+    return copiedPath;
 }
 
 void DirectoryTracker::setCurrentScanPath(const std::string& path) {
@@ -576,4 +373,44 @@ std::string DirectoryTracker::getCurrentScanPath() {
 std::shared_ptr<Directory> DirectoryTracker::getCurrentView() {
     std::lock_guard<std::mutex> lock(treeMutex);
     return currentView;
+}
+
+std::string getOsRootDirectory() {
+#if defined(_WIN32) || defined(_WIN64)
+    wchar_t winDir[MAX_PATH] = {0};
+    UINT len = GetWindowsDirectoryW(winDir, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        fs::path osPath(winDir);
+        fs::path root = osPath.root_path();
+        if (!root.empty()) {
+            std::error_code ec;
+            fs::path preferred = root.make_preferred();
+            if (fs::exists(preferred, ec)) {
+                return pathToUtf8(preferred);
+            }
+        }
+    }
+
+    char* sysDrive = nullptr;
+    size_t envLen = 0;
+    if (_dupenv_s(&sysDrive, &envLen, "SystemDrive") == 0 && sysDrive != nullptr) {
+        fs::path driveRoot = pathFromUtf8(std::string(sysDrive) + "\\").make_preferred();
+        free(sysDrive);
+        std::error_code ec;
+        if (fs::exists(driveRoot, ec)) {
+            return pathToUtf8(driveRoot);
+        }
+    }
+
+    return "C:\\";
+#else
+    std::error_code ec;
+    fs::path rootPath("/");
+    if (fs::exists(rootPath, ec)) {
+        return pathToUtf8(rootPath.make_preferred());
+    }
+
+    const char* homeDir = std::getenv("HOME");
+    return homeDir ? std::string(homeDir) : pathToUtf8(fs::current_path(ec));
+#endif
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <string>
 #include <memory>
 #include <raylib.h>
 #include <raymath.h>
@@ -19,6 +20,8 @@ class Visualizer {
     Vector2 sunburstCenter;
     std::vector<DrawnSector> sectors;
     int listScrollOffset = 0;
+    std::string statusBanner;
+    float statusTimer = 0.0f;
 
     // Added parentHue parameter to keep child colors consistent with parents
     void drawTree(const std::shared_ptr<Directory>& dir, int currentLayer, float startAngle, float endAngle, float parentHue = -1.0f);
