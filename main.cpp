@@ -13,10 +13,11 @@ int main() {
 
     std::string defaultRoot;
 #if defined(_WIN32) || defined(_WIN64)
-    const char* userProfile = std::getenv("USERPROFILE");
-    defaultRoot = userProfile ? userProfile : "C:\\";
+
+    defaultRoot = "C:\\";
     const char* windowTitle = "Directory Tracker - Stream Engine (Windows)";
 #else
+// change the thing below later
     const char* homeDir = std::getenv("HOME");
     defaultRoot = homeDir ? homeDir : fs::current_path().string();
     const char* windowTitle = "Directory Tracker - Stream Engine (Linux)";

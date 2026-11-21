@@ -194,7 +194,7 @@ void Visualizer::render(std::shared_ptr<Directory> view, DirectoryTracker& track
         DrawRectangle(0, 0, screenWidth, 40, Fade(BLACK, 0.8f));
         DrawText(("Scanning: " + truncateString(tracker.getCurrentScanPath(), 90)).c_str(), 10, 10, 20, GREEN);
     } else if (view) {
-        DrawText(TextFormat("Current Root: %s", view->path.c_str()), 10, 10, 20, RAYWHITE);
+        DrawText(TextFormat("current directory: %s", view->path.c_str()), 10, 10, 20, RAYWHITE);
     }
     
     DrawLine(730, 40, 730, screenHeight - 40, GRAY);
